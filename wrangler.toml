@@ -1,9 +1,0 @@
-name = "devped-ph"
-main = "src/index.js"
-compatibility_date = "2026-08-03"
-workers_dev = true
-
-[[d1_databases]]
-binding = "DB"
-database_name = "devped-ph-db"
-database_id = "09b59f85-c655-435f-89f0-aa406347ca2d"
