@@ -16,7 +16,7 @@
     {
       "binding": "DB",
       "database_name": "devped-ph-db",
-      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+      "database_id": "09b59f85-c655-435f-89f0-aa406347ca2d"
     }
   ],
 
@@ -24,8 +24,8 @@
   // Create with: wrangler kv namespace create CACHE
   //              wrangler kv namespace create RATE_LIMIT
   "kv_namespaces": [
-    { "binding": "CACHE", "id": "REPLACE_WITH_YOUR_CACHE_KV_ID" },
-    { "binding": "RATE_LIMIT", "id": "REPLACE_WITH_YOUR_RATE_LIMIT_KV_ID" }
+    { "binding": "CACHE", "id": "c49e8b59b90d4f49a077977c581c7e04" },
+    { "binding": "RATE_LIMIT", "id": "85f482f763ae42779c6ddb9c0d1121f2" }
   ],
 
   // ---- Plain (non-secret) vars -----------------------------------------
