@@ -144,7 +144,6 @@ function isAdminAuthed(request: Request, env: Env): boolean {
 
 async function ensureSchema(db: D1Database): Promise<void> {
   await db.exec(`
-    PRAGMA foreign_keys = ON;
     CREATE TABLE IF NOT EXISTS meta (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
