@@ -274,6 +274,15 @@ const SCHEMA_STATEMENTS = [
 // ALTERs simply fail harmlessly because the column is already present from
 // SCHEMA_STATEMENTS above.
 async function ensureStatusColumn(db: D1Database, table: 'clinics' | 'doctors'): Promise<void> {
+  // Now runs before SCHEMA_STATEMENTS creates the tables, so on a brand
+  // new database neither table exists yet — nothing to migrate, and the
+  // CREATE TABLE statements below already include `status` from the start.
+  const tableExists = await db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .bind(table)
+    .first();
+  if (!tableExists) return;
+
   const info = await db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
   const hasStatus = (info.results || []).some((c) => c.name === 'status');
   if (!hasStatus) {
@@ -318,10 +327,15 @@ async function ensureImportLogsColumns(db: D1Database): Promise<void> {
 }
 
 async function ensureSchema(db: D1Database): Promise<void> {
+  // Both of these must run BEFORE the SCHEMA_STATEMENTS batch below, not
+  // after — that batch creates indexes on columns (import_logs.adapter,
+  // clinics.status, doctors.status) that only exist on legacy tables once
+  // these migrations have run. Running them after the batch means the
+  // batch itself fails first on any pre-existing table missing a column.
   await ensureImportLogsColumns(db);
-  await db.batch(SCHEMA_STATEMENTS.map((sql) => db.prepare(sql)));
   await ensureStatusColumn(db, 'clinics');
   await ensureStatusColumn(db, 'doctors');
+  await db.batch(SCHEMA_STATEMENTS.map((sql) => db.prepare(sql)));
 
   const meta = await db.prepare(`SELECT value FROM meta WHERE key = 'bootstrap_done'`).first<{ value: string }>();
   if (!meta?.value) {
