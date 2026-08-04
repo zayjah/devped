@@ -221,18 +221,19 @@ export const googlePlacesAdapter: SourceAdapter = {
     if (!apiKey) throw new Error('GOOGLE_PLACES_API_KEY is not set (wrangler secret put GOOGLE_PLACES_API_KEY)');
 
     const out: RawClinicRecord[] = [];
+    const issues: string[] = [];
 
     for (const target of TARGET_CITIES) {
       const query = `developmental pediatric clinic OR children's hospital in ${target.city}, Philippines`;
       const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${apiKey}`;
       const res = await fetch(url);
       if (!res.ok) {
-        console.error(`Places text search failed for ${target.city}: HTTP ${res.status}`);
+        issues.push(`${target.city}: HTTP ${res.status}`);
         continue;
       }
-      const data = await res.json<{ results?: PlacesTextSearchResult[]; status: string }>();
+      const data = await res.json<{ results?: PlacesTextSearchResult[]; status: string; error_message?: string }>();
       if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
-        console.error(`Places text search error for ${target.city}: ${data.status}`);
+        issues.push(`${target.city}: ${data.status}${data.error_message ? ` — ${data.error_message}` : ''}`);
         continue;
       }
 
@@ -252,6 +253,13 @@ export const googlePlacesAdapter: SourceAdapter = {
           source: 'Google Places',
         });
       }
+    }
+
+    // Every city failed and nothing was fetched — surface the real reason
+    // (bad key, billing not enabled, API not enabled, etc.) instead of
+    // returning silently with an empty array, which looked like success.
+    if (out.length === 0 && issues.length > 0) {
+      throw new Error(issues.join(' | '));
     }
 
     return out;
