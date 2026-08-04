@@ -1,9 +1,13 @@
 import { seedDatabase } from './seed.js';
 
+import { runImport } from './importer.js';
+
 export interface Env {
   DB: D1Database;
   ASSETS?: Fetcher;
   ADMIN_TOKEN?: string;
+  // Set via: npx wrangler secret put GOOGLE_PLACES_API_KEY
+  GOOGLE_PLACES_API_KEY?: string;
 }
 
 // ---- Shared response shapes ----
@@ -27,6 +31,7 @@ interface Doctor {
   lastVerifiedDate: string | null;
   sources: string[];
   affiliations: Affiliation[];
+  status: string;
 }
 
 interface Clinic {
@@ -42,6 +47,7 @@ interface Clinic {
   verified: boolean;
   doctorCount: number;
   lastVerifiedDate: string | null;
+  status: string;
 }
 
 interface Review {
@@ -67,6 +73,7 @@ interface DoctorRow {
   last_verified_date: string | null;
   sources_json: string | null;
   affiliations?: string | null;
+  status: string;
 }
 
 interface ClinicRow {
@@ -83,6 +90,7 @@ interface ClinicRow {
   doctor_count?: number | null;
   live_doctor_count?: number | null;
   last_verified_date: string | null;
+  status: string;
 }
 
 interface ReviewRow {
@@ -165,7 +173,8 @@ const SCHEMA_STATEMENTS = [
     image TEXT,
     verified INTEGER NOT NULL DEFAULT 0,
     doctor_count INTEGER NOT NULL DEFAULT 0,
-    last_verified_date TEXT
+    last_verified_date TEXT,
+    status TEXT NOT NULL DEFAULT 'published'
   )`,
   `CREATE TABLE IF NOT EXISTS doctors (
     id TEXT PRIMARY KEY,
@@ -178,7 +187,8 @@ const SCHEMA_STATEMENTS = [
     review_count INTEGER NOT NULL DEFAULT 0,
     verified INTEGER NOT NULL DEFAULT 0,
     last_verified_date TEXT,
-    sources_json TEXT NOT NULL DEFAULT '[]'
+    sources_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'published'
   )`,
   `CREATE TABLE IF NOT EXISTS doctor_clinics (
     id TEXT PRIMARY KEY,
@@ -208,6 +218,39 @@ const SCHEMA_STATEMENTS = [
     moderated_at TEXT,
     moderator_notes TEXT
   )`,
+  `CREATE TABLE IF NOT EXISTS import_candidates (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    raw_json TEXT NOT NULL,
+    match_status TEXT NOT NULL DEFAULT 'conflicting',
+    best_match_id TEXT,
+    best_match_score REAL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS import_logs (
+    id TEXT PRIMARY KEY,
+    adapter TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'partial',
+    fetched_clinics INTEGER NOT NULL DEFAULT 0,
+    auto_merged INTEGER NOT NULL DEFAULT 0,
+    pending INTEGER NOT NULL DEFAULT 0,
+    conflicting INTEGER NOT NULL DEFAULT 0,
+    errors_json TEXT NOT NULL DEFAULT '[]',
+    started_at TEXT NOT NULL,
+    finished_at TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS verification_logs (
+    id TEXT PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    action TEXT NOT NULL,
+    detail TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_import_candidates_status ON import_candidates(match_status)`,
+  `CREATE INDEX IF NOT EXISTS idx_import_logs_adapter ON import_logs(adapter)`,
   `CREATE INDEX IF NOT EXISTS idx_clinics_city ON clinics(city)`,
   `CREATE INDEX IF NOT EXISTS idx_clinics_province ON clinics(province)`,
   `CREATE INDEX IF NOT EXISTS idx_clinics_status ON clinics(verified)`,
@@ -220,10 +263,28 @@ const SCHEMA_STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status)`,
   `CREATE INDEX IF NOT EXISTS idx_reports_doctor ON reports(doctor_id)`,
   `CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)`,
+  `CREATE INDEX IF NOT EXISTS idx_clinics_pubstatus ON clinics(status)`,
+  `CREATE INDEX IF NOT EXISTS idx_doctors_pubstatus ON doctors(status)`,
 ];
+
+// CREATE TABLE IF NOT EXISTS is a no-op on a table that already existed
+// before the `status` column was introduced — it does NOT add the missing
+// column (this bit us once already with doctor_count). This backfills it on
+// any database created before this column existed; on a fresh database both
+// ALTERs simply fail harmlessly because the column is already present from
+// SCHEMA_STATEMENTS above.
+async function ensureStatusColumn(db: D1Database, table: 'clinics' | 'doctors'): Promise<void> {
+  const info = await db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
+  const hasStatus = (info.results || []).some((c) => c.name === 'status');
+  if (!hasStatus) {
+    await db.exec(`ALTER TABLE ${table} ADD COLUMN status TEXT NOT NULL DEFAULT 'published'`);
+  }
+}
 
 async function ensureSchema(db: D1Database): Promise<void> {
   await db.batch(SCHEMA_STATEMENTS.map((sql) => db.prepare(sql)));
+  await ensureStatusColumn(db, 'clinics');
+  await ensureStatusColumn(db, 'doctors');
 
   const meta = await db.prepare(`SELECT value FROM meta WHERE key = 'bootstrap_done'`).first<{ value: string }>();
   if (!meta?.value) {
@@ -250,6 +311,7 @@ function rowToDoctor(row: DoctorRow): Doctor {
     // LEFT JOIN with no matching clinic still produces one placeholder row
     // (clinicId: null) via json_group_array — drop those before returning.
     affiliations: rawAffiliations.filter((a): a is Affiliation => a != null && a.clinicId != null),
+    status: row.status,
   };
 }
 
@@ -267,6 +329,7 @@ function rowToClinic(row: ClinicRow): Clinic {
     verified: Boolean(row.verified),
     doctorCount: Number(row.doctor_count || 0),
     lastVerifiedDate: row.last_verified_date,
+    status: row.status,
   };
 }
 
@@ -295,8 +358,9 @@ async function getDoctors(db: D1Database, filters: DoctorFilters = {}): Promise<
     clauses.push('d.specialty = ?');
     binds.push(filters.specialty);
   }
+  clauses.push(`d.status = 'published'`);
 
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const where = `WHERE ${clauses.join(' AND ')}`;
   const query = `
     SELECT
       d.*,
@@ -339,13 +403,13 @@ async function getDoctorById(db: D1Database, id: string): Promise<Doctor | null>
 }
 
 async function getClinics(db: D1Database, city: string | null): Promise<Clinic[]> {
-  const clauses: string[] = [];
+  const clauses: string[] = [`c.status = 'published'`];
   const binds: unknown[] = [];
   if (city && city !== 'All') {
     clauses.push('c.city = ?');
     binds.push(city);
   }
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const where = `WHERE ${clauses.join(' AND ')}`;
   // doctor_count is computed live from doctor_clinics so it never drifts out
   // of sync with reality, regardless of what was typed into that column.
   const result = await db.prepare(`
@@ -445,7 +509,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
 
     if (method === 'GET') {
       const clinic = await getClinicById(env.DB, id);
-      if (!clinic) return json({ error: 'Clinic not found' }, { status: 404 });
+      if (!clinic || clinic.status !== 'published') return json({ error: 'Clinic not found' }, { status: 404 });
       return json(clinic);
     }
 
@@ -515,7 +579,7 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
 
     if (method === 'GET') {
       const doctor = await getDoctorById(env.DB, id);
-      if (!doctor) return json({ error: 'Doctor not found' }, { status: 404 });
+      if (!doctor || doctor.status !== 'published') return json({ error: 'Doctor not found' }, { status: 404 });
       return json(doctor);
     }
 
@@ -634,6 +698,111 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
     return json({ ok: true });
   }
 
+  // ---- Admin: pending-review queue for imported/new clinics & doctors ----
+  if (pathname === '/api/admin/clinics' && method === 'GET') {
+    if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
+    const status = searchParams.get('status') || 'pending_review';
+    const result = await env.DB.prepare(`SELECT * FROM clinics WHERE status = ? ORDER BY last_verified_date DESC`).bind(status).all<ClinicRow>();
+    return json((result.results || []).map((r) => rowToClinic(r)));
+  }
+
+  if (pathname.match(/^\/api\/admin\/clinics\/[^/]+\/(approve|reject)$/) && method === 'POST') {
+    if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
+    const parts = pathname.split('/').filter(Boolean);
+    const id = parts[3];
+    const action = parts[4];
+    await env.DB.prepare(`UPDATE clinics SET status = ? WHERE id = ?`)
+      .bind(action === 'approve' ? 'published' : 'rejected', id).run();
+    return json({ ok: true });
+  }
+
+  if (pathname === '/api/admin/doctors' && method === 'GET') {
+    if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
+    const status = searchParams.get('status') || 'pending_review';
+    const result = await env.DB.prepare(`SELECT * FROM doctors WHERE status = ? ORDER BY last_verified_date DESC`).bind(status).all<DoctorRow>();
+    return json((result.results || []).map((r) => rowToDoctor({ ...r, affiliations: '[]' })));
+  }
+
+  if (pathname.match(/^\/api\/admin\/doctors\/[^/]+\/(approve|reject)$/) && method === 'POST') {
+    if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
+    const parts = pathname.split('/').filter(Boolean);
+    const id = parts[3];
+    const action = parts[4];
+    await env.DB.prepare(`UPDATE doctors SET status = ? WHERE id = ?`)
+      .bind(action === 'approve' ? 'published' : 'rejected', id).run();
+    return json({ ok: true });
+  }
+
+  // ---- Admin: import pipeline ----
+  if (pathname === '/api/admin/import-candidates' && method === 'GET') {
+    if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
+    const status = searchParams.get('status') || 'conflicting';
+    const result = await env.DB.prepare(
+      `SELECT * FROM import_candidates WHERE match_status = ? ORDER BY created_at DESC`
+    ).bind(status).all();
+    return json(result.results);
+  }
+
+  if (pathname.match(/^\/api\/admin\/import-candidates\/[^/]+\/merge$/) && method === 'POST') {
+    if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
+    const id = pathname.split('/').filter(Boolean)[3];
+    const body = await request.json<Record<string, any>>().catch(() => ({}));
+    const candidate = await env.DB.prepare(`SELECT * FROM import_candidates WHERE id = ?`).bind(id).first<{
+      id: string; kind: string; raw_json: string; best_match_id: string | null;
+    }>();
+    if (!candidate) return json({ error: 'Candidate not found' }, { status: 404 });
+    const raw = JSON.parse(candidate.raw_json);
+    const targetId: string | undefined = body?.targetId || candidate.best_match_id || undefined;
+
+    if (candidate.kind === 'clinic') {
+      if (targetId) {
+        await env.DB.prepare(`UPDATE clinics SET phone = COALESCE(NULLIF(phone, ''), ?), last_verified_date = ? WHERE id = ?`)
+          .bind(raw.phone, new Date().toISOString().slice(0, 10), targetId).run();
+      } else {
+        const newClinicId = newId('clinic');
+        await env.DB.prepare(`
+          INSERT INTO clinics (id, name, city, province, address, phone, lat, lng, image, verified, doctor_count, last_verified_date, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 'published')
+        `).bind(newClinicId, raw.name, raw.city, raw.province, raw.address, raw.phone, raw.lat, raw.lng, raw.image, new Date().toISOString().slice(0, 10)).run();
+      }
+    }
+
+    await env.DB.prepare(`UPDATE import_candidates SET match_status = 'merged', resolved_at = ? WHERE id = ?`)
+      .bind(new Date().toISOString(), id).run();
+    return json({ ok: true });
+  }
+
+  if (pathname.match(/^\/api\/admin\/import-candidates\/[^/]+\/discard$/) && method === 'POST') {
+    if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
+    const id = pathname.split('/').filter(Boolean)[3];
+    await env.DB.prepare(`UPDATE import_candidates SET match_status = 'discarded', resolved_at = ? WHERE id = ?`)
+      .bind(new Date().toISOString(), id).run();
+    return json({ ok: true });
+  }
+
+  if (pathname === '/api/admin/import/run' && method === 'POST') {
+    if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
+    const summaries = await runImport(env.DB, env);
+    return json({ summaries });
+  }
+
+  if (pathname === '/api/admin/import-logs' && method === 'GET') {
+    if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
+    const status = searchParams.get('status');
+    const result = status
+      ? await env.DB.prepare(`SELECT * FROM import_logs WHERE status = ? ORDER BY started_at DESC`).bind(status).all()
+      : await env.DB.prepare(`SELECT * FROM import_logs ORDER BY started_at DESC`).all();
+    return json(result.results);
+  }
+
+  if (pathname.startsWith('/api/admin/import-logs/') && method === 'GET') {
+    if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
+    const id = pathname.split('/').filter(Boolean)[3];
+    const row = await env.DB.prepare(`SELECT * FROM import_logs WHERE id = ?`).bind(id).first();
+    if (!row) return json({ error: 'Import log not found' }, { status: 404 });
+    return json(row);
+  }
+
   return null; // not an /api/* route this Worker recognizes
 }
 
@@ -668,5 +837,14 @@ export default {
     } catch (err) {
       return json({ error: err instanceof Error ? err.message : 'Internal error' }, { status: 500 });
     }
+  },
+
+  // Nightly cron trigger (see wrangler.toml [triggers]) — also runnable
+  // manually via POST /api/admin/import/run.
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    await ensureSchema(env.DB);
+    ctx.waitUntil(
+      runImport(env.DB, env).catch((err) => console.error('scheduled runImport failed', err))
+    );
   },
 };
