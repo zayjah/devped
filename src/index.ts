@@ -268,15 +268,17 @@ const SCHEMA_STATEMENTS = [
 ];
 
 // CREATE TABLE IF NOT EXISTS is a no-op on a table that already existed
-// before the `status` column was introduced — it does NOT add the missing
-// column (this bit us once already with doctor_count). This backfills it on
-// any database created before this column existed; on a fresh database both
-// ALTERs simply fail harmlessly because the column is already present from
-// SCHEMA_STATEMENTS above.
-async function ensureStatusColumn(db: D1Database, table: 'clinics' | 'doctors'): Promise<void> {
-  // Now runs before SCHEMA_STATEMENTS creates the tables, so on a brand
-  // new database neither table exists yet — nothing to migrate, and the
-  // CREATE TABLE statements below already include `status` from the start.
+// before a given column was introduced — it does NOT add the missing
+// column. This has bitten us repeatedly as columns got added over time
+// (doctor_count, then `status`, then `adapter`, then `kind`). This generic
+// helper backfills any missing columns on an existing table via ALTER
+// TABLE; on a fresh database the table doesn't exist yet, so it's a no-op
+// and SCHEMA_STATEMENTS below creates it correctly with every column
+// already present. Must run BEFORE the SCHEMA_STATEMENTS batch, not after —
+// that batch creates indexes on some of these columns (import_logs.adapter,
+// clinics.status, doctors.status, import_candidates.kind), and a legacy
+// table missing the column would fail the whole batch before it got here.
+async function ensureColumns(db: D1Database, table: string, requiredColumns: Array<[string, string]>): Promise<void> {
   const tableExists = await db
     .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
     .bind(table)
@@ -284,30 +286,18 @@ async function ensureStatusColumn(db: D1Database, table: 'clinics' | 'doctors'):
   if (!tableExists) return;
 
   const info = await db.prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
-  const hasStatus = (info.results || []).some((c) => c.name === 'status');
-  if (!hasStatus) {
-    await db.exec(`ALTER TABLE ${table} ADD COLUMN status TEXT NOT NULL DEFAULT 'published'`);
+  const existing = new Set((info.results || []).map((c) => c.name));
+  for (const [name, definition] of requiredColumns) {
+    if (!existing.has(name)) {
+      await db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+    }
   }
 }
 
-// Same problem as ensureStatusColumn, but for import_logs: an earlier
-// deploy created this table before the `adapter` column (and friends)
-// existed. CREATE TABLE IF NOT EXISTS won't add missing columns to a table
-// that's already there, and since the CREATE INDEX on import_logs(adapter)
-// runs in the same batch as the CREATE TABLE, a legacy table with no
-// `adapter` column breaks that whole batch — which runs on every request,
-// so it takes down the entire API. This backfills any missing columns
-// before that batch runs; on a fresh database the table doesn't exist yet
-// so this is a no-op and SCHEMA_STATEMENTS creates it correctly.
-async function ensureImportLogsColumns(db: D1Database): Promise<void> {
-  const table = await db
-    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'import_logs'`)
-    .first();
-  if (!table) return;
-
-  const info = await db.prepare(`PRAGMA table_info(import_logs)`).all<{ name: string }>();
-  const existing = new Set((info.results || []).map((c) => c.name));
-  const requiredColumns: Array<[string, string]> = [
+async function ensureSchema(db: D1Database): Promise<void> {
+  await ensureColumns(db, 'clinics', [['status', `TEXT NOT NULL DEFAULT 'published'`]]);
+  await ensureColumns(db, 'doctors', [['status', `TEXT NOT NULL DEFAULT 'published'`]]);
+  await ensureColumns(db, 'import_logs', [
     ['adapter', `TEXT NOT NULL DEFAULT ''`],
     ['status', `TEXT NOT NULL DEFAULT 'partial'`],
     ['fetched_clinics', `INTEGER NOT NULL DEFAULT 0`],
@@ -317,24 +307,17 @@ async function ensureImportLogsColumns(db: D1Database): Promise<void> {
     ['errors_json', `TEXT NOT NULL DEFAULT '[]'`],
     ['started_at', `TEXT NOT NULL DEFAULT ''`],
     ['finished_at', `TEXT`],
-  ];
-
-  for (const [name, definition] of requiredColumns) {
-    if (!existing.has(name)) {
-      await db.exec(`ALTER TABLE import_logs ADD COLUMN ${name} ${definition}`);
-    }
-  }
-}
-
-async function ensureSchema(db: D1Database): Promise<void> {
-  // Both of these must run BEFORE the SCHEMA_STATEMENTS batch below, not
-  // after — that batch creates indexes on columns (import_logs.adapter,
-  // clinics.status, doctors.status) that only exist on legacy tables once
-  // these migrations have run. Running them after the batch means the
-  // batch itself fails first on any pre-existing table missing a column.
-  await ensureImportLogsColumns(db);
-  await ensureStatusColumn(db, 'clinics');
-  await ensureStatusColumn(db, 'doctors');
+  ]);
+  await ensureColumns(db, 'import_candidates', [
+    ['kind', `TEXT NOT NULL DEFAULT 'clinic'`],
+    ['source', `TEXT NOT NULL DEFAULT ''`],
+    ['raw_json', `TEXT NOT NULL DEFAULT '{}'`],
+    ['match_status', `TEXT NOT NULL DEFAULT 'conflicting'`],
+    ['best_match_id', `TEXT`],
+    ['best_match_score', `REAL`],
+    ['created_at', `TEXT NOT NULL DEFAULT ''`],
+    ['resolved_at', `TEXT`],
+  ]);
   await db.batch(SCHEMA_STATEMENTS.map((sql) => db.prepare(sql)));
 
   const meta = await db.prepare(`SELECT value FROM meta WHERE key = 'bootstrap_done'`).first<{ value: string }>();
