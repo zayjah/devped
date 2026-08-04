@@ -18,7 +18,11 @@ export interface RawClinicRecord {
 
 export interface SourceAdapter {
   name: string;
-  fetchClinics(env: Env): Promise<RawClinicRecord[]>;
+  // cityFilter limits a run to a single target city so the total subrequest
+  // count (1 search + 1 details call per result) stays under the Workers
+  // per-invocation limit. Omit to run every configured city — only safe if
+  // your account's subrequest limit is high enough (paid plans).
+  fetchClinics(env: Env, cityFilter?: string): Promise<RawClinicRecord[]>;
   // Doctor-level data (specialty, schedule) has no wired source yet — see
   // README note. Adapters that can't supply doctors should just return [].
   fetchDoctors(env: Env): Promise<never[]>;
@@ -189,7 +193,7 @@ export async function matchAndStageClinic(
 // Starting coverage — add more as you verify results. Each city runs one
 // Text Search call plus one Place Details call per result (for phone), so
 // keep this list deliberately short until you've checked API costs.
-const TARGET_CITIES: Array<{ city: string; province: string }> = [
+export const TARGET_CITIES: Array<{ city: string; province: string }> = [
   { city: 'Cebu City', province: 'Cebu' },
   { city: 'Taguig', province: 'Metro Manila' },
   { city: 'Davao City', province: 'Davao del Sur' },
@@ -213,17 +217,28 @@ async function fetchPlaceDetails(placeId: string, apiKey: string): Promise<{ pho
   return { phone: data.result?.formatted_phone_number || '' };
 }
 
+// Caps subrequests per city (1 search + up to this many details calls) so
+// that even a full multi-city run stays well under the Workers free-plan
+// limit of 50 subrequests per invocation.
+const MAX_RESULTS_PER_CITY = 8;
+
 export const googlePlacesAdapter: SourceAdapter = {
   name: 'google-places',
 
-  async fetchClinics(env: Env): Promise<RawClinicRecord[]> {
+  async fetchClinics(env: Env, cityFilter?: string): Promise<RawClinicRecord[]> {
     const apiKey = (env as Env & { GOOGLE_PLACES_API_KEY?: string }).GOOGLE_PLACES_API_KEY;
     if (!apiKey) throw new Error('GOOGLE_PLACES_API_KEY is not set (wrangler secret put GOOGLE_PLACES_API_KEY)');
 
     const out: RawClinicRecord[] = [];
     const issues: string[] = [];
+    const cities = cityFilter
+      ? TARGET_CITIES.filter((t) => t.city.toLowerCase() === cityFilter.toLowerCase())
+      : TARGET_CITIES;
+    if (cityFilter && cities.length === 0) {
+      throw new Error(`Unknown city "${cityFilter}". Valid options: ${TARGET_CITIES.map((t) => t.city).join(', ')}`);
+    }
 
-    for (const target of TARGET_CITIES) {
+    for (const target of cities) {
       const query = `developmental pediatric clinic OR children's hospital in ${target.city}, Philippines`;
       const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${apiKey}`;
       const res = await fetch(url);
@@ -237,7 +252,7 @@ export const googlePlacesAdapter: SourceAdapter = {
         continue;
       }
 
-      for (const place of data.results || []) {
+      for (const place of (data.results || []).slice(0, MAX_RESULTS_PER_CITY)) {
         const details = await fetchPlaceDetails(place.place_id, apiKey).catch(() => null);
         out.push({
           name: place.name,
@@ -279,7 +294,7 @@ export const registry: SourceAdapter[] = [googlePlacesAdapter];
 // Running the pipeline + logging each run
 // ============================================================================
 
-export async function runImport(db: D1Database, env: Env): Promise<AdapterSummary[]> {
+export async function runImport(db: D1Database, env: Env, cityFilter?: string): Promise<AdapterSummary[]> {
   const summaries: AdapterSummary[] = [];
 
   for (const adapter of registry) {
@@ -294,7 +309,7 @@ export async function runImport(db: D1Database, env: Env): Promise<AdapterSummar
     let autoMerged = 0, pending = 0, conflicting = 0, fetchedClinics = 0;
 
     try {
-      const clinics = await adapter.fetchClinics(env);
+      const clinics = await adapter.fetchClinics(env, cityFilter);
       fetchedClinics = clinics.length;
       for (const raw of clinics) {
         try {

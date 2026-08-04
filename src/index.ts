@@ -1,6 +1,6 @@
 import { seedDatabase } from './seed.js';
 
-import { runImport } from './importer.js';
+import { runImport, TARGET_CITIES } from './importer.js';
 
 export interface Env {
   DB: D1Database;
@@ -833,7 +833,14 @@ async function handleApi(request: Request, env: Env, url: URL): Promise<Response
 
   if (pathname === '/api/admin/import/run' && method === 'POST') {
     if (!isAdminAuthed(request, env)) return json({ error: 'Unauthorized' }, { status: 401 });
-    const summaries = await runImport(env.DB, env);
+    // Optional ?city=Cebu City — runs the import for just that one target
+    // city instead of all of them in a single invocation. Doing all 5
+    // cities at once (1 search + 1 details call per result, per city) can
+    // exceed the Workers subrequest limit (50 on the free plan) and fail
+    // outright. Call this once per city from the client, or rely on the
+    // cron trigger which now does the same thing automatically.
+    const city = searchParams.get('city');
+    const summaries = await runImport(env.DB, env, city || undefined);
     return json({ summaries });
   }
 
@@ -891,11 +898,18 @@ export default {
   },
 
   // Nightly cron trigger (see wrangler.toml [triggers]) — also runnable
-  // manually via POST /api/admin/import/run.
+  // manually via POST /api/admin/import/run. Runs ONE city per night,
+  // rotating through TARGET_CITIES by day-of-year, rather than all of them
+  // in one invocation — running all 5 at once can exceed the Workers
+  // subrequest limit per invocation. Over ~5 nights every city gets covered.
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     await ensureSchema(env.DB);
+    const dayOfYear = Math.floor(
+      (Date.now() - Date.UTC(new Date().getUTCFullYear(), 0, 0)) / 86400000
+    );
+    const city = TARGET_CITIES[dayOfYear % TARGET_CITIES.length].city;
     ctx.waitUntil(
-      runImport(env.DB, env).catch((err) => console.error('scheduled runImport failed', err))
+      runImport(env.DB, env, city).catch((err) => console.error('scheduled runImport failed', err))
     );
   },
 };
