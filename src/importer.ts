@@ -168,10 +168,23 @@ export async function matchAndStageClinic(
 
   if (target && target.score >= CONFLICT_LOWER_BOUND) {
     // Ambiguous — stage for a human to resolve rather than guessing.
-    await db.prepare(
-      `INSERT INTO import_candidates (id, kind, source, raw_json, match_status, best_match_id, best_match_score, created_at)
-       VALUES (?, 'clinic', ?, ?, 'conflicting', ?, ?, ?)`
-    ).bind(newId('cand'), raw.source, JSON.stringify(raw), target.row.id, target.score, new Date().toISOString()).run();
+    //
+    // The production import_candidates table turned out to predate this
+    // codebase's schema entirely — it has its own legacy NOT NULL column
+    // called `entity_type` (not `kind`) with no default, so a plain insert
+    // fails there even after backfilling `kind`. Rather than hardcode
+    // another column-name guess, check what's actually on the table and
+    // populate entity_type too, only if it exists.
+    const info = await db.prepare(`PRAGMA table_info(import_candidates)`).all<{ name: string }>();
+    const hasEntityType = (info.results || []).some((c) => c.name === 'entity_type');
+    const insertSql = hasEntityType
+      ? `INSERT INTO import_candidates (id, kind, entity_type, source, raw_json, match_status, best_match_id, best_match_score, created_at)
+         VALUES (?, 'clinic', 'clinic', ?, ?, 'conflicting', ?, ?, ?)`
+      : `INSERT INTO import_candidates (id, kind, source, raw_json, match_status, best_match_id, best_match_score, created_at)
+         VALUES (?, 'clinic', ?, ?, 'conflicting', ?, ?, ?)`;
+    await db.prepare(insertSql)
+      .bind(newId('cand'), raw.source, JSON.stringify(raw), target.row.id, target.score, new Date().toISOString())
+      .run();
     await logVerification(db, 'clinic', target.row.id, 'import_staged_conflict', `source=${raw.source} score=${target.score.toFixed(3)}`);
     return 'staged_conflict';
   }
