@@ -281,7 +281,44 @@ async function ensureStatusColumn(db: D1Database, table: 'clinics' | 'doctors'):
   }
 }
 
+// Same problem as ensureStatusColumn, but for import_logs: an earlier
+// deploy created this table before the `adapter` column (and friends)
+// existed. CREATE TABLE IF NOT EXISTS won't add missing columns to a table
+// that's already there, and since the CREATE INDEX on import_logs(adapter)
+// runs in the same batch as the CREATE TABLE, a legacy table with no
+// `adapter` column breaks that whole batch — which runs on every request,
+// so it takes down the entire API. This backfills any missing columns
+// before that batch runs; on a fresh database the table doesn't exist yet
+// so this is a no-op and SCHEMA_STATEMENTS creates it correctly.
+async function ensureImportLogsColumns(db: D1Database): Promise<void> {
+  const table = await db
+    .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'import_logs'`)
+    .first();
+  if (!table) return;
+
+  const info = await db.prepare(`PRAGMA table_info(import_logs)`).all<{ name: string }>();
+  const existing = new Set((info.results || []).map((c) => c.name));
+  const requiredColumns: Array<[string, string]> = [
+    ['adapter', `TEXT NOT NULL DEFAULT ''`],
+    ['status', `TEXT NOT NULL DEFAULT 'partial'`],
+    ['fetched_clinics', `INTEGER NOT NULL DEFAULT 0`],
+    ['auto_merged', `INTEGER NOT NULL DEFAULT 0`],
+    ['pending', `INTEGER NOT NULL DEFAULT 0`],
+    ['conflicting', `INTEGER NOT NULL DEFAULT 0`],
+    ['errors_json', `TEXT NOT NULL DEFAULT '[]'`],
+    ['started_at', `TEXT NOT NULL DEFAULT ''`],
+    ['finished_at', `TEXT`],
+  ];
+
+  for (const [name, definition] of requiredColumns) {
+    if (!existing.has(name)) {
+      await db.exec(`ALTER TABLE import_logs ADD COLUMN ${name} ${definition}`);
+    }
+  }
+}
+
 async function ensureSchema(db: D1Database): Promise<void> {
+  await ensureImportLogsColumns(db);
   await db.batch(SCHEMA_STATEMENTS.map((sql) => db.prepare(sql)));
   await ensureStatusColumn(db, 'clinics');
   await ensureStatusColumn(db, 'doctors');
