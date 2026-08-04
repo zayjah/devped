@@ -123,6 +123,85 @@ const AUTO_MERGE_THRESHOLD = 0.92;
 const AUTO_MERGE_MARGIN = 0.05;
 const CONFLICT_LOWER_BOUND = 0.55;
 
+// The production import_candidates table turned out to predate this
+// codebase's schema by more than one column — first `entity_type`, now
+// `raw_payload`, both NOT NULL with no default and both absent from this
+// file's own schema. Rather than keep adding one more hardcoded
+// column-name guess every time a new one surfaces, this builds the INSERT
+// dynamically: it only writes columns that actually exist on the table,
+// and for any *other* NOT NULL column with no default (i.e. any further
+// unknown legacy leftover), it fills in the closest semantic match by
+// column name so the insert doesn't fail on a constraint the code can't
+// see by name alone.
+async function insertImportCandidate(
+  db: D1Database,
+  values: {
+    id: string;
+    kind: string;
+    source: string;
+    rawJson: string;
+    matchStatus: string;
+    bestMatchId: string | null;
+    bestMatchScore: number | null;
+    createdAt: string;
+  }
+): Promise<void> {
+  const info = await db
+    .prepare(`PRAGMA table_info(import_candidates)`)
+    .all<{ name: string; notnull: number; dflt_value: string | null }>();
+  const columns = info.results || [];
+  const existing = new Set(columns.map((c) => c.name));
+
+  const insertCols: string[] = [];
+  const insertVals: unknown[] = [];
+  const addCol = (name: string, value: unknown) => {
+    insertCols.push(name);
+    insertVals.push(value);
+  };
+
+  const knownColumns: Record<string, unknown> = {
+    id: values.id,
+    kind: values.kind,
+    source: values.source,
+    raw_json: values.rawJson,
+    match_status: values.matchStatus,
+    best_match_id: values.bestMatchId,
+    best_match_score: values.bestMatchScore,
+    created_at: values.createdAt,
+  };
+  for (const [name, value] of Object.entries(knownColumns)) {
+    if (existing.has(name)) addCol(name, value);
+  }
+
+  for (const col of columns) {
+    if (col.name in knownColumns) continue;
+    if (col.notnull && col.dflt_value === null) {
+      const lower = col.name.toLowerCase();
+      let guess: unknown = values.kind;
+      if (lower.includes('json') || lower.includes('payload') || lower.includes('data') || lower.includes('raw')) {
+        guess = values.rawJson;
+      } else if (lower.includes('status')) {
+        guess = values.matchStatus;
+      } else if (lower.includes('source')) {
+        guess = values.source;
+      } else if (lower.includes('score')) {
+        guess = values.bestMatchScore ?? 0;
+      } else if (lower.includes('id')) {
+        guess = values.bestMatchId ?? values.id;
+      } else if (lower.includes('at') || lower.includes('date') || lower.includes('time')) {
+        guess = values.createdAt;
+      }
+      addCol(col.name, guess);
+    }
+  }
+
+  const placeholders = insertCols.map(() => '?').join(', ');
+  await db
+    .prepare(`INSERT INTO import_candidates (${insertCols.join(', ')}) VALUES (${placeholders})`)
+    .bind(...insertVals)
+    .run();
+}
+
 export async function matchAndStageClinic(
   db: D1Database,
   raw: RawClinicRecord
@@ -168,23 +247,16 @@ export async function matchAndStageClinic(
 
   if (target && target.score >= CONFLICT_LOWER_BOUND) {
     // Ambiguous — stage for a human to resolve rather than guessing.
-    //
-    // The production import_candidates table turned out to predate this
-    // codebase's schema entirely — it has its own legacy NOT NULL column
-    // called `entity_type` (not `kind`) with no default, so a plain insert
-    // fails there even after backfilling `kind`. Rather than hardcode
-    // another column-name guess, check what's actually on the table and
-    // populate entity_type too, only if it exists.
-    const info = await db.prepare(`PRAGMA table_info(import_candidates)`).all<{ name: string }>();
-    const hasEntityType = (info.results || []).some((c) => c.name === 'entity_type');
-    const insertSql = hasEntityType
-      ? `INSERT INTO import_candidates (id, kind, entity_type, source, raw_json, match_status, best_match_id, best_match_score, created_at)
-         VALUES (?, 'clinic', 'clinic', ?, ?, 'conflicting', ?, ?, ?)`
-      : `INSERT INTO import_candidates (id, kind, source, raw_json, match_status, best_match_id, best_match_score, created_at)
-         VALUES (?, 'clinic', ?, ?, 'conflicting', ?, ?, ?)`;
-    await db.prepare(insertSql)
-      .bind(newId('cand'), raw.source, JSON.stringify(raw), target.row.id, target.score, new Date().toISOString())
-      .run();
+    await insertImportCandidate(db, {
+      id: newId('cand'),
+      kind: 'clinic',
+      source: raw.source,
+      rawJson: JSON.stringify(raw),
+      matchStatus: 'conflicting',
+      bestMatchId: target.row.id,
+      bestMatchScore: target.score,
+      createdAt: new Date().toISOString(),
+    });
     await logVerification(db, 'clinic', target.row.id, 'import_staged_conflict', `source=${raw.source} score=${target.score.toFixed(3)}`);
     return 'staged_conflict';
   }
