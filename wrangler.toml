@@ -1,9 +1,41 @@
+# IMPORTANT: this "name" controls the subdomain you deploy to:
+#   name = "devped"  ->  https://devped.<your-subdomain>.workers.dev
+# Your frontend (components/api.js) is hardcoded to call
+# https://devped.rjezm-tadlas.workers.dev — so this MUST stay "devped",
+# not "devped-ph", or `wrangler deploy` will create a second, different
+# Worker and your live site will keep running whatever old code is
+# currently sitting at the "devped" name.
 name = "devped"
 main = "src/index.ts"
 compatibility_date = "2026-08-03"
 workers_dev = true
 
+# Serves devped-ph-web/ as the site itself, so the same Worker answers both
+# page loads (/, /pages/*, etc.) and API calls (/api/*) with no CORS needed.
+[assets]
+directory = "../devped-ph-web"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "devped-ph-db"
 database_id = "09b59f85-c655-435f-89f0-aa406347ca2d"
+
+# Runs the Google Places import pipeline nightly at 02:00 UTC. Trigger it
+# manually anytime via POST /api/admin/import/run instead of waiting.
+[triggers]
+crons = ["0 2 * * *"]
+
+# Required for the import pipeline (src/importer.ts) to call the Places API:
+#   npx wrangler secret put GOOGLE_PLACES_API_KEY
+# Get a key + enable billing at https://console.cloud.google.com/apis/credentials
+# (Places API has a free monthly quota, then pay-per-request).
+
+# Optional but recommended: protects the admin write endpoints
+# (create/edit/delete clinics & doctors, approve/reject reviews, etc).
+# Uncomment and set a long random value, then set the SAME value in the
+# app via window.DEVPED_ADMIN_TOKEN before opening #/admin, OR just paste
+# it into the "Admin token" field the admin page will prompt for.
+# [vars]
+# ADMIN_TOKEN = "change-me-to-something-long-and-random"
